@@ -21,40 +21,85 @@ const logger = (...args) => {
 
 require('mathjax-full/es5/tex-svg-full');
 
-const ScrollerModule = BdApi.Webpack.getByKeys("scrollerInner", "navigationDescription") || BdApi.Webpack.getByKeys("scrollerInner");
-
-const CLASS_SCROLLER_INNER = ScrollerModule ? ScrollerModule.scrollerInner : "scrollerInner-2PPAp2";
-
-if (DEBUG) {
-    logger("Module Classes Check:", { 
-        scroller: CLASS_SCROLLER_INNER,
-    });
-}
+// RegexPatterns
+// Anchored to ensure we don't accidentally replace a code block that contains mixed content (text + latex),
+// which would result in the text being deleted. We allow surrounding whitespace.
+const BLOCK_MATH_REGEX = /^\s*(\$\$|\\\[)([\s\S]+?)(\$\$|\\\])\s*$/;
+const INLINE_MATH_REGEX = /^\s*(\$|\\\()([\s\S]+?)(\$|\\\))\s*$/;
 
 export default class Plugin {
     observer = null;
     switchId = 0; 
+    classScrollerInner = "scrollerInner-2PPAp2";
+    typesetPromiseChain = Promise.resolve();
 
     start() {
         logger("Plugin Started");
+        this.getScrollerClass();
         this.onSwitch();
     }
+    
+    getScrollerClass() {
+        try {
+            let ScrollerModule;
+            // Safe check for BdApi
+            const api = window.BdApi;
+            if (api) {
+                if (api.Webpack && api.Webpack.getByKeys) {
+                    ScrollerModule = api.Webpack.getByKeys("scrollerInner", "navigationDescription") || api.Webpack.getByKeys("scrollerInner");
+                } else if (api.findModuleByProps) {
+                    ScrollerModule = api.findModuleByProps("scrollerInner", "navigationDescription") || api.findModuleByProps("scrollerInner");
+                }
+            }
+
+            if (ScrollerModule && ScrollerModule.scrollerInner) {
+                this.classScrollerInner = ScrollerModule.scrollerInner;
+            }
+            
+            if (DEBUG) {
+                logger("Module Classes Check:", { 
+                    scroller: this.classScrollerInner,
+                });
+            }
+        } catch (e) {
+            console.warn("[LaTeX Plugin] Scroller class resolution failed:", e);
+        }
+    }
+
 
     stop() {
         logger("Plugin Stopped");
         if (this.observer) this.observer.disconnect();
     }
 
-    async typeset() {
-        try {
-            if (window.MathJax && window.MathJax.typesetPromise) {
-                await window.MathJax.typesetPromise();
-            } else if (window.MathJax && window.MathJax.typeset) {
-                window.MathJax.typeset();
+    async typeset(elements) {
+        // Chain typeset calls to prevent "MathJax is already typesetting" errors
+        this.typesetPromiseChain = this.typesetPromiseChain.then(async () => {
+            try {
+                if (window.MathJax) {
+                    // Method 1: typesetPromise (Preferred)
+                    if (window.MathJax.typesetPromise) {
+                        if (elements && elements.length > 0) {
+                            await window.MathJax.typesetPromise(elements);
+                        } else if (!elements) {
+                            await window.MathJax.typesetPromise();
+                        }
+                    } 
+                    // Method 2: typeset (Synchronous fallback)
+                    else if (window.MathJax.typeset) {
+                        if (elements && elements.length > 0) {
+                            window.MathJax.typeset(elements);
+                        } else {
+                            window.MathJax.typeset();
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn("[LaTeX Plugin] Typeset error:", error);
             }
-        } catch (error) {
-            console.warn("[LaTeX Plugin] Typeset error:", error);
-        }
+        });
+        
+        await this.typesetPromiseChain;
     }
 
     onSwitch = async () => {
@@ -66,14 +111,15 @@ export default class Plugin {
         const currentSwitchId = ++this.switchId;
         logger(`Switching Channel (ID: ${currentSwitchId})...`);
         
-        let channels = document.querySelector("." + CLASS_SCROLLER_INNER) || document.querySelector("[class*='scrollerInner']");
+        // Use class property instead of global constant
+        let channels = document.querySelector("." + this.classScrollerInner) || document.querySelector("[class*='scrollerInner']");
         
         if (!channels) {
             for (let i = 0; i < 20; i++) {
                 if (this.switchId !== currentSwitchId) return;
                 
                 await new Promise(r => setTimeout(r, 100));
-                channels = document.querySelector("." + CLASS_SCROLLER_INNER) || document.querySelector("[class*='scrollerInner']");
+                channels = document.querySelector("." + this.classScrollerInner) || document.querySelector("[class*='scrollerInner']");
                 if (channels) break;
             }
         }
@@ -84,18 +130,20 @@ export default class Plugin {
             logger("Scroller found! Attaching Observer.");
             this.observer = new MutationObserver(this.handleMutations);
             
-            // 使用 ID 選擇器，這是最穩健的方法，因為 Discord 訊息內容幾乎總是有 id="message-content-..."
             const messages = channels.querySelectorAll("[id^='message-content']");
             logger(`Found ${messages.length} existing messages using ID selector`);
             
-            let needsTypeset = false;
+            const elementsToTypeset = [];
             messages.forEach(msg => {
-                if (this.parseMessage(msg)) needsTypeset = true;
+                const newElements = this.parseMessage(msg);
+                if (newElements && newElements.length > 0) {
+                    elementsToTypeset.push(...newElements);
+                }
             });
             
-            if (needsTypeset) {
-                logger("Initial Typeset Triggered");
-                this.typeset();
+            if (elementsToTypeset.length > 0) {
+                logger(`Initial Typeset Triggered for ${elementsToTypeset.length} elements`);
+                this.typeset(elementsToTypeset);
             }
 
             this.observer.observe(channels, {
@@ -109,66 +157,78 @@ export default class Plugin {
     }
 
     handleMutations = (mutationsList) => {
-        let needsTypeset = false;
+        const elementsToTypeset = [];
 
         for (const mutation of mutationsList) {
             if (mutation.type === "childList") {
+                // Determine if we are inside a message content block (e.g. edited message)
+                if (mutation.target instanceof Element && mutation.target.closest("[id^='message-content']")) {
+                     const messageContent = mutation.target.closest("[id^='message-content']");
+                     const newElements = this.parseMessage(messageContent);
+                     if (newElements) elementsToTypeset.push(...newElements);
+                }
+
                 for (const node of mutation.addedNodes) {
                     if (!(node instanceof Element)) continue;
 
-                    // 檢查新增節點本身是否是訊息內容 (使用 id 檢查)
+                    // Standard new message handling
                     if (node.id && node.id.startsWith("message-content")) {
-                        if (this.parseMessage(node)) needsTypeset = true;
+                         const newElements = this.parseMessage(node);
+                         if (newElements) elementsToTypeset.push(...newElements);
                     } 
-                    // 檢查是否包含訊息內容
                     else {
                         const contents = node.querySelectorAll("[id^='message-content']");
                         if (contents.length > 0) {
                             contents.forEach(content => {
-                                if (this.parseMessage(content)) needsTypeset = true;
+                                const newElements = this.parseMessage(content);
+                                if (newElements) elementsToTypeset.push(...newElements);
                             });
                         }
-                        // 備用方案：如果新增的是 messageListItem，仍然嘗試查找 class
+                        // Fallback for list items
                         else if (node.classList.contains("messageListItem_c19a55") || node.querySelector("[class*='messageContent']")) {
                              const content = node.querySelector("[class*='messageContent']");
-                             if (content && this.parseMessage(content)) needsTypeset = true;
+                             if (content) {
+                                  const newElements = this.parseMessage(content);
+                                  if (newElements) elementsToTypeset.push(...newElements);
+                             }
                         }
                     }
                 }
             } else if (mutation.type === "characterData") {
-                // 編輯訊息時
                 const target = mutation.target.parentElement;
                 if (target) {
                     const messageContent = target.closest("[id^='message-content']");
                     if (messageContent) {
-                         if (this.parseMessage(messageContent)) needsTypeset = true;
+                         const newElements = this.parseMessage(messageContent);
+                         if (newElements) elementsToTypeset.push(...newElements);
                     }
                 }
             }
         }
 
-        if (needsTypeset) {
-            logger("New content detected, triggering typeset");
-            this.typeset();
+        if (elementsToTypeset.length > 0) {
+            logger(`New content detected, triggering typeset for ${elementsToTypeset.length} elements`);
+            this.typeset(elementsToTypeset);
         }
     };
 
     parseMessage(messageContent) {
-        if (!messageContent) return false;
-        let containsTex = false;
+        if (!messageContent) return null;
+        const newElements = [];
 
         const codeElements = messageContent.querySelectorAll("code");
         if (DEBUG && codeElements.length > 0) logger(`Found ${codeElements.length} code elements`);
 
         codeElements.forEach((codeElement) => {
-            const rawText = codeElement.innerText || codeElement.textContent;
+            // Prefer textContent for raw text, innerText as fallback
+            const rawText = codeElement.textContent || codeElement.innerText;
             if (!rawText) return;
             
             const codeText = rawText.trim();
             const sanitize = x => x.replace(/\\unicode/g, ''); 
             
             if (DEBUG) {
-                 logger(`Checking Content: '${codeText.substring(0, 10)}...'`);
+                 logger(`Checking Content: '${codeText.substring(0, 20)}...'`);
             }
 
             const findReplaceTarget = (el) => el.closest("pre") || el;
@@ -178,15 +238,12 @@ export default class Plugin {
             let mathContent = null;
             let isBlock = false;
 
-            // Regex 匹配，更寬鬆且準確
-            // 匹配 $$ ... $$ 或 \[ ... \]
-            const blockMatch = codeText.match(/^(\$\$|\\\[)([\s\S]*)(\$\$|\\\])$/);
+            const blockMatch = codeText.match(BLOCK_MATH_REGEX);
             if (blockMatch) {
                 mathContent = blockMatch[2];
                 isBlock = true;
             } else {
-                // 匹配 $ ... $ 或 \( ... \)
-                const inlineMatch = codeText.match(/^(\$|\\\()([\s\S]*)(\$|\\\))$/);
+                const inlineMatch = codeText.match(INLINE_MATH_REGEX);
                 if (inlineMatch) {
                     mathContent = inlineMatch[2];
                     isBlock = false;
@@ -197,14 +254,18 @@ export default class Plugin {
                 const tag = isBlock ? "mthjxblock" : "mthjxinline";
                 const endTag = isBlock ? "mthjxblockend" : "mthjxinlineend";
                 
-                targetElement.outerHTML = "<span>" + tag + sanitize(mathContent) + endTag + "</span>";
-                containsTex = true;
+                const span = document.createElement('span');
+                span.innerHTML = tag + sanitize(mathContent) + endTag;
+                span.dataset.latexProcessed = "true"; 
+                
+                targetElement.replaceWith(span);
+                newElements.push(span);
                 logger("LaTeX Rendered!");
             } else {
                 if (DEBUG) logger("Not matched as LaTeX:", codeText);
             }
         });
 
-        return containsTex;
+        return newElements.length > 0 ? newElements : null;
     }
 };
